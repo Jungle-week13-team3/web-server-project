@@ -1,0 +1,5 @@
+# 빌드 결과물
+*.o
+echo/hostinfo
+echo/echoclient
+echo/echoserveri
