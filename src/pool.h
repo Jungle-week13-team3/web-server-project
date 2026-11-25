@@ -29,6 +29,8 @@ struct thread_pool {
     pthread_cond_t not_empty;  /* "일감이 생겼다" 알림. 작업 스레드가 기다린다 */
     pthread_cond_t not_full;   /* "자리가 생겼다" 알림. main이 기다린다 */
     pthread_t threads[POOL_THREADS];
+    int thread_count; /* 실제로 띄운 스레드 수 (종료 때 이만큼 기다린다) */
+    int stopping;     /* 1이면 새 일감 없음. 큐에 남은 것까지만 처리하고 스레드가 끝난다 */
     pool_handler handler;
     void *arg;
 };
@@ -36,5 +38,6 @@ struct thread_pool {
 int pool_start(struct thread_pool *pool, pool_handler handler, void *arg);
 void pool_submit(struct thread_pool *pool, const struct pool_job *job);
 int pool_take(struct thread_pool *pool, struct pool_job *job);
+void pool_stop(struct thread_pool *pool);
 
 #endif

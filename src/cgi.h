@@ -11,6 +11,8 @@
 #define CGI_NAME_MAX    256
 #define CGI_TYPE_MAX    128
 #define CGI_OUTPUT_MAX  (1024 * 1024) /* 프로그램 출력은 1MB까지. 넘으면 500 */
+#define CGI_TIMEOUT_SEC 5             /* 프로그램이 이 시간 안에 끝내지 않으면 강제로 끝내고 504 */
+#define CGI_TIMED_OUT   (-2)
 
 int is_cgi_request(const char *uri);
 int parse_cgi_uri(const char *uri, char *name, size_t name_cap, const char **query);

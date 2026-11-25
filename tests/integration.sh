@@ -28,13 +28,16 @@ printf '#!/bin/sh\nsleep 1\necho "Content-Type: text/plain"\necho\necho slept\n'
 # CGI 프로세스가 물려받은 소켓 수와 파이프 수. 소켓 0개, 파이프는 표준입력·출력 2개여야 한다.
 # (전체 개수는 세지 않는다. 서버를 띄운 터미널이 넘겨준 fd처럼 서버와 무관한 것도 섞여 있다)
 printf '#!/bin/sh\necho "Content-Type: text/plain"\necho\nfds=$(ls -l /proc/self/fd)\necho "socket=$(echo "$fds" | grep -c socket:) pipe=$(echo "$fds" | grep -c pipe:)"\n' > "$CGI/fds.sh"
-chmod 755 "$CGI/fail.sh" "$CGI/badout.sh" "$CGI/sleep.sh" "$CGI/fds.sh"
+# 끝나지 않는 CGI. 셸이 띄운 sleep(손자 프로세스)까지 같이 끝나는지 보려고 흔치 않은 숫자 31을 쓴다
+printf '#!/bin/sh\nsleep 31\necho "Content-Type: text/plain"\necho\necho never\n' > "$CGI/hang.sh"
+chmod 755 "$CGI/fail.sh" "$CGI/badout.sh" "$CGI/sleep.sh" "$CGI/fds.sh" "$CGI/hang.sh"
 chmod 644 "$CGI/noexec.sh"
 
 # 프록시 테스트: 뒤 서버 두 대 + 규칙 파일. 18099는 아무도 안 듣는 포트(죽은 서버 흉내)
 B1=$((PORT + 11))
 B2=$((PORT + 12))
 DEAD=$((PORT + 19))
+HANG=$((PORT + 18)) # 접속은 받지만 영원히 답하지 않는 뒤 서버
 ROUTES="$CGI/routes.conf"
 cat > "$ROUTES" <<EOF
 # 테스트용 프록시 규칙
@@ -42,7 +45,17 @@ cat > "$ROUTES" <<EOF
 /img/ / 127.0.0.1:$B1 127.0.0.1:$B2
 /dead/ / 127.0.0.1:$DEAD
 /failover/ /cgi-bin/ 127.0.0.1:$DEAD 127.0.0.1:$B1
+/hang/ / 127.0.0.1:$HANG
 EOF
+python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $HANG)); s.listen()
+conns = []
+while True:
+    c, _ = s.accept(); conns.append(c)   # 받기만 하고 아무 답도 안 한다
+" &
+HANG_PID=$!
 head -c 3000000 /dev/urandom > "$ROOT/big.bin"   # 3MB 바이너리: 1MB 본문 제한과 상관없이 중계되는지
 
 ./server "$B1" "$ROOT" "$CGI" > /tmp/web-backend1.log 2>&1 &
@@ -51,7 +64,8 @@ B1_PID=$!
 B2_PID=$!
 ./server "$PORT" "$ROOT" "$CGI" "$ROUTES" > /tmp/web-server-test.log 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID $B1_PID $B2_PID 2>/dev/null; chmod 644 "$ROOT/noperm.txt"; rm -rf "$ROOT" "$CGI"' EXIT
+# 끝낼 때 SIGTERM으로 끄고 다 끝날 때까지 기다린다. 서버가 정상 종료해야 ASan 빌드의 누수 보고가 로그에 남는다
+trap 'kill $SERVER_PID $B1_PID $B2_PID $HANG_PID 2>/dev/null; wait 2>/dev/null; chmod 644 "$ROOT/noperm.txt"; rm -rf "$ROOT" "$CGI"' EXIT
 sleep 0.5
 
 # raw 요청 문자열을 nc로 보내고, 응답 첫 줄의 상태 코드를 출력한다. 응답이 없으면 빈 문자열.
@@ -273,6 +287,45 @@ got1=$(( $(grep -c 'adder?a=77' /tmp/web-backend1.log) - before1 ))
 got2=$(( $(grep -c 'adder?a=77' /tmp/web-backend2.log) - before2 ))
 check "동시 프록시 40개 → Round-Robin 20/20" "20/20" "$got1/$got2"
 check_alive
+
+# --- 10단계: 시간 제한과 안전한 종료 ---
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/cgi-bin/hang.sh")
+t1=$(now_ms)
+check "멈춘 CGI → 504 (약 5초)" "504 ok" "$code $( [ $((t1 - t0)) -ge 4500 ] && [ $((t1 - t0)) -lt 7000 ] && echo ok || echo "$((t1 - t0))ms")"
+sleep 0.2
+check "  └ CGI가 띄운 sleep까지 끝남" "0" "$(pgrep -fc 'sleep 31')"
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/hang/x")
+t1=$(now_ms)
+check "답 없는 뒤 서버 → 504 (약 5초)" "504 ok" "$code $( [ $((t1 - t0)) -ge 4500 ] && [ $((t1 - t0)) -lt 7000 ] && echo ok || echo "$((t1 - t0))ms")"
+check_alive
+
+# 따로 띄운 서버에 1초짜리 요청을 보내 둔 채로 Ctrl+C(SIGINT)를 보낸다
+S_PORT=$((PORT + 30))
+./server "$S_PORT" "$ROOT" "$CGI" > /tmp/web-shutdown.log 2>&1 &
+S_PID=$!
+sleep 0.5
+curl -s "http://$HOST:$S_PORT/cgi-bin/sleep.sh" > "$ROOT/.inflight" &
+CURL_PID=$!
+sleep 0.3
+kill -INT $S_PID
+sleep 0.2
+check "종료 중에는 새 연결을 안 받음" "000" "$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$S_PORT/")"
+timeout 10 tail --pid=$S_PID -f /dev/null
+wait $S_PID; s_exit=$?
+wait $CURL_PID
+check "SIGINT → 하던 요청은 끝까지 응답" "slept" "$(cat "$ROOT/.inflight")"
+check "SIGINT → 종료 코드 0, 'stopped' 출력" "0 1" "$s_exit $(grep -c '^stopped$' /tmp/web-shutdown.log)"
+
+./server "$S_PORT" "$ROOT" "$CGI" > /tmp/web-shutdown.log 2>&1 &
+S_PID=$!
+sleep 0.5
+curl -s -o /dev/null "http://$HOST:$S_PORT/"
+kill -TERM $S_PID
+timeout 10 tail --pid=$S_PID -f /dev/null
+wait $S_PID; s_exit=$?
+check "SIGTERM → 종료 코드 0" "0" "$s_exit"
 
 check "틀린 규칙 파일 → 서버 시작 거부" "1" \
     "$(printf '/api/ /cgi-bin/\n' > "$CGI/bad.conf"; ./server $((PORT + 20)) "$ROOT" "$CGI" "$CGI/bad.conf" >/dev/null 2>&1; echo $?)"

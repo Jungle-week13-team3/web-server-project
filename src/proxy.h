@@ -12,6 +12,8 @@
 #define PROXY_PREFIX_MAX   64
 #define PROXY_HOST_MAX     64
 #define PROXY_PORT_MAX     8
+#define BACKEND_TIMEOUT_SEC 5    /* 뒤 서버 읽기·쓰기 한 번의 최대 대기. 넘으면 504 */
+#define PROXY_TIMED_OUT    (-2)
 
 /* 뒤 서버 하나의 주소. "127.0.0.1:9001" → host "127.0.0.1", port "9001" */
 struct proxy_backend {

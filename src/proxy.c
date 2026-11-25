@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp, strncasecmp */
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "net.h"
@@ -195,15 +197,20 @@ static int append_line(char *out, size_t cap, size_t *used, const char *line)
 }
 
 /* 뒤 서버 응답을 읽어 클라에 넘긴다. 상태 줄과 헤더는 Connection만 클라 쪽 값으로 바꾸고, 본문은 바이트 그대로 보낸다.
- * 클라에 아무것도 보내기 전에 실패하면 -1(→ 502). 보내기 시작했으면 *sent = 1, 뒤 서버의 상태 코드를 돌려준다. */
+ * 클라에 아무것도 보내기 전에 실패하면 -1(→ 502), 뒤 서버가 제한 시간 안에 답을 시작하지 않으면 PROXY_TIMED_OUT(→ 504).
+ * 보내기 시작했으면 *sent = 1, 뒤 서버의 상태 코드를 돌려준다. */
 static int relay_response(int backend_fd, int connfd, char *head, int *keep_alive, int *sent)
 {
     struct line_reader reader;
     char line[LINE_READER_BUF_SIZE];
     init_line_reader(&reader, backend_fd);
 
-    /* 상태 줄 "HTTP/1.1 200 OK"에서 상태 코드만 꺼내 둔다 (로그용) */
-    if (read_line(&reader, line, sizeof(line)) <= 0)
+    /* 상태 줄 "HTTP/1.1 200 OK"에서 상태 코드만 꺼내 둔다 (로그용).
+     * 읽기 시간 제한(SO_RCVTIMEO)이 지나면 read가 EAGAIN으로 실패한다 = 뒤 서버가 답을 안 한다 */
+    ssize_t first = read_line(&reader, line, sizeof(line));
+    if (first == READ_LINE_ERROR && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return PROXY_TIMED_OUT;
+    if (first <= 0)
         return -1;
     int status;
     if (sscanf(line, "HTTP/%*d.%*d %d", &status) != 1 || status < 100 || status > 999)
@@ -311,11 +318,18 @@ int serve_proxy(int connfd, struct proxy_route *route, const struct http_request
         return 502; /* 뒤 서버가 전부 응답하지 않는다 */
     }
 
+    /* 뒤 서버와 주고받는 읽기·쓰기 한 번마다 최대 대기 시간을 건다. 안 걸면 멈춘 뒤 서버가 작업 스레드를 영원히 붙잡는다 */
+    struct timeval tv = { .tv_sec = BACKEND_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(backend_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(backend_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     int status = 502;
     if (write_all(backend_fd, head, (size_t)head_len) == 0 &&
         (req->body_len == 0 || write_all(backend_fd, req->body, req->body_len) == 0)) {
         int rc = relay_response(backend_fd, connfd, head, keep_alive, sent);
-        if (rc > 0)
+        if (rc == PROXY_TIMED_OUT)
+            status = 504;
+        else if (rc > 0)
             status = rc;
     }
     close(backend_fd);

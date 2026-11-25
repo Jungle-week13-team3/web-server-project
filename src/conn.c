@@ -1,5 +1,6 @@
 #include "conn.h"
 
+#include <stdatomic.h> /* atomic_int: 스레드 사이에 안전한 변수 (C11) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,24 @@
 #include "static.h"
 
 #define RESPONSE_HEAD_MAX 512
+
+/* 종료 요청 표시. main 스레드의 시그널 처리 함수가 쓰고, 작업 스레드들이 읽는다.
+ * atomic_int는 여러 스레드가 잠금 없이 동시에 읽고 써도 안전한 정수다.
+ * (volatile sig_atomic_t는 시그널 처리 함수와 같은 스레드 사이에서만 안전해서, 스레드 사이에는 쓸 수 없다)
+ * 잠금 없이 동작하는(lock-free) atomic이라 시그널 처리 함수 안에서 바꿔도 안전하다. */
+static atomic_int shutting_down = 0;
+
+/* 서버를 끄는 중이라고 표시한다. 시그널 처리 함수에서 불러도 안전하다(atomic 변수 하나만 바꾼다). */
+void request_shutdown(void)
+{
+    atomic_store(&shutting_down, 1);
+}
+
+/* 서버를 끄는 중이면 1. 이때는 keep-alive를 하지 않고 지금 응답을 마지막으로 연결을 닫는다. */
+int is_shutting_down(void)
+{
+    return atomic_load(&shutting_down);
+}
 
 /* 에러 상태 코드를 받아 "404 Not Found" 같은 문구를 본문으로 한 text/plain 응답을 보낸다. */
 static void send_text_response(int connfd, int status, int keep_alive)
@@ -138,8 +157,8 @@ static int handle_one_request(int connfd, struct line_reader *reader,
         }
     }
 
-    /* ⑤ 갈림길 → 응답 */
-    int keep_alive = wants_keep_alive(&req);
+    /* ⑤ 갈림길 → 응답. 서버가 꺼지는 중이면 이 응답을 마지막으로 연결을 닫는다 */
+    int keep_alive = wants_keep_alive(&req) && !is_shutting_down();
     int sent = 0;
     status = dispatch_request(connfd, config, &req, &keep_alive, &sent);
     log_request(&req, status);
@@ -154,9 +173,10 @@ static int handle_one_request(int connfd, struct line_reader *reader,
  * 소켓을 닫는 건 부른 쪽(main)이 한다. */
 void serve_connection(int connfd, const struct server_config *config)
 {
-    /* 읽기마다 최대 대기 시간을 건다. 반복 서버라서 가만히 있는 클라 하나가 다른 클라를 전부 막기 때문이다 */
+    /* 읽기·쓰기마다 최대 대기 시간을 건다. 가만히 있거나 응답을 안 받아 가는 클라가 작업 스레드를 붙잡지 못하게 한다 */
     struct timeval tv = { .tv_sec = KEEP_ALIVE_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     /* reader는 연결이 끝날 때까지 하나를 계속 쓴다. 앞 요청 뒤에 붙어 온 다음 요청 바이트가 여기 남아 있을 수 있다 */
     struct line_reader reader;

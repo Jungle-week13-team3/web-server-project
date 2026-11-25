@@ -15,5 +15,7 @@ struct server_config {
 };
 
 void serve_connection(int connfd, const struct server_config *config);
+void request_shutdown(void);
+int is_shutting_down(void);
 
 #endif

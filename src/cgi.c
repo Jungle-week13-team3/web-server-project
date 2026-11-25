@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,21 +125,77 @@ static void run_cgi_child(const char *path, char *const envp[], int in_fd, int o
 
     /* 부모(서버)가 무시하던 SIGPIPE를 원래대로 돌린다. 프로그램은 보통의 환경에서 돌아야 한다 */
     signal(SIGPIPE, SIG_DFL);
+    /* 자기만의 프로세스 그룹을 만든다. 시간 초과 때 부모가 이 그룹을 통째로 끝낼 수 있게 */
+    setpgid(0, 0);
+    /* 작업 스레드는 SIGINT·SIGTERM을 막아 둔 상태이고, fork한 자식도 그 설정을 물려받는다.
+     * 프로그램은 막힌 것 없이 시작해야 하므로 전부 푼다 */
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
 
     char *argv[] = { (char *)path, NULL };
     execve(path, argv, envp);
     _exit(127); /* 여기 왔다면 execve 실패 */
 }
 
-/* [부모 프로세스] fd에서 EOF까지 읽어 malloc한 버퍼로 돌려준다. 길이는 *len.
- * 출력이 CGI_OUTPUT_MAX를 넘거나 읽기 오류면 NULL. */
-static char *read_all_output(int fd, size_t *len)
+/* 지금부터 deadline까지 남은 시간(ms). 이미 지났으면 0. */
+static int remaining_ms(const struct timespec *deadline)
 {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (deadline->tv_sec - now.tv_sec) * 1000 + (deadline->tv_nsec - now.tv_nsec) / 1000000;
+    return ms > 0 ? (int)ms : 0;
+}
+
+/* fd가 events(읽기 POLLIN·쓰기 POLLOUT) 가능해질 때까지 deadline까지만 기다린다.
+ * 준비됨 1, 시간 초과 0, 오류 -1. poll은 "이 fd 준비되면 깨워 줘"를 시간 제한과 함께 OS에 맡기는 함수다. */
+static int wait_fd_until(int fd, short events, const struct timespec *deadline)
+{
+    for (;;) {
+        struct pollfd p = { .fd = fd, .events = events };
+        int rc = poll(&p, 1, remaining_ms(deadline));
+        if (rc < 0 && errno == EINTR)
+            continue;
+        return rc < 0 ? -1 : (rc > 0 ? 1 : 0);
+    }
+}
+
+/* [부모] 본문을 CGI 표준입력 파이프에 쓴다. fd는 막히지 않는(non-blocking) 상태여야 한다.
+ * 프로그램이 본문을 안 읽고 멈춰 있어도 deadline이 지나면 포기한다. 성공 0, 시간 초과 CGI_TIMED_OUT, 오류 -1. */
+static int write_body_until(int fd, const char *buf, size_t len, const struct timespec *deadline)
+{
+    while (len > 0) {
+        int ready = wait_fd_until(fd, POLLOUT, deadline);
+        if (ready <= 0)
+            return ready == 0 ? CGI_TIMED_OUT : -1;
+        ssize_t n = write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
+            return -1; /* 프로그램이 입력을 닫고 끝났다(EPIPE). 출력은 그대로 받으면 된다 */
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* [부모 프로세스] fd에서 EOF까지 읽어 malloc한 버퍼로 돌려준다. 길이는 *len.
+ * deadline이 지나면 *timed_out = 1과 NULL. 출력이 CGI_OUTPUT_MAX를 넘거나 읽기 오류여도 NULL. */
+static char *read_all_output(int fd, size_t *len, const struct timespec *deadline, int *timed_out)
+{
+    *timed_out = 0;
     size_t cap = 4096, used = 0;
     char *buf = malloc(cap);
     if (buf == NULL)
         return NULL;
     for (;;) {
+        int ready = wait_fd_until(fd, POLLIN, deadline);
+        if (ready <= 0) {
+            *timed_out = (ready == 0);
+            free(buf);
+            return NULL;
+        }
         if (used == cap) {
             if (cap >= CGI_OUTPUT_MAX) {
                 free(buf);
@@ -167,7 +225,7 @@ static char *read_all_output(int fd, size_t *len)
 }
 
 /* /cgi-bin/ 요청을 처리한다. 프로그램을 실행하고 출력 전체를 받은 뒤, 머리를 붙여 클라에 보낸다.
- * 보냈으면 200, 못 보냈으면 아무것도 보내지 않고 403·404·500을 돌려준다. 에러 응답은 부른 쪽이 보낸다. */
+ * 보냈으면 200, 못 보냈으면 아무것도 보내지 않고 403·404·500·504를 돌려준다. 에러 응답은 부른 쪽이 보낸다. */
 int serve_cgi(int connfd, const char *cgi_dir, const struct http_request *req, int keep_alive)
 {
     /* ① URI → 프로그램 경로와 입력 */
@@ -215,22 +273,39 @@ int serve_cgi(int connfd, const char *cgi_dir, const struct http_request *req, i
     close(in_pipe[0]);
     close(out_pipe[1]);
 
+    /* 여기부터 CGI_TIMEOUT_SEC 안에 본문 전달과 출력 받기가 끝나야 한다 */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += CGI_TIMEOUT_SEC;
+
     /* 본문을 넘기고 닫는다. 닫아야 프로그램이 "입력 끝"을 안다.
-     * 프로그램이 본문을 안 읽고 끝났으면 쓰기가 실패하는데(EPIPE), 출력은 그대로 받으면 된다 */
-    if (req->body_len > 0)
-        write_all(in_pipe[1], req->body, req->body_len);
+     * 막히지 않게 해 두고 써야, 프로그램이 본문을 안 읽고 멈춰 있을 때 시간 제한이 먹는다 */
+    int timed_out = 0;
+    if (req->body_len > 0) {
+        fcntl(in_pipe[1], F_SETFL, O_NONBLOCK);
+        timed_out = (write_body_until(in_pipe[1], req->body, req->body_len, &deadline) == CGI_TIMED_OUT);
+    }
     close(in_pipe[1]);
 
     size_t out_len = 0;
-    char *out = read_all_output(out_pipe[0], &out_len);
+    char *out = NULL;
+    if (!timed_out)
+        out = read_all_output(out_pipe[0], &out_len, &deadline, &timed_out);
     close(out_pipe[0]);
-    if (out == NULL)
-        kill(pid, SIGKILL); /* 출력이 너무 크다: 더 기다리지 않게 끝낸다 */
+
+    /* 시간 초과나 출력 초과면 프로그램을 강제로 끝낸다. 음수 pid = 프로세스 그룹 전체:
+     * 셸 스크립트가 띄운 sleep 같은 손자 프로세스까지 같이 끝낸다 */
+    if (out == NULL) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL); /* 자식이 아직 그룹을 못 만들었을 때를 대비 */
+    }
 
     /* 자식이 끝나길 기다려 정리한다. 안 하면 끝난 자식이 좀비로 남는다 */
     int wstatus;
     while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR)
         ;
+    if (timed_out)
+        return 504; /* 프로그램이 제한 시간 안에 답하지 않았다 */
     if (out == NULL)
         return 500;
     if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
