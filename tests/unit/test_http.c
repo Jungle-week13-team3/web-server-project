@@ -25,6 +25,13 @@ static void test_parse_request_line(void)
     assert(parse_request_line("GET / HTTP/1.1 extra", &req) == -1);     /* 칸 4개 */
     assert(parse_request_line("GET  / HTTP/1.1", &req) == -1);          /* 공백 2개 → 빈 칸 */
     assert(parse_request_line("GET index.html HTTP/1.1", &req) == -1);  /* '/'로 시작 안 함 */
+    assert(parse_request_line("GET ftp://x/ HTTP/1.1", &req) == -1);    /* http 말고 다른 주소 */
+
+    /* 포워드 프록시용 전체 주소와 CONNECT는 형식으로는 통과한다 */
+    assert(parse_request_line("GET http://127.0.0.1:9001/a?b=1 HTTP/1.1", &req) == 0);
+    assert(strcmp(req.uri, "http://127.0.0.1:9001/a?b=1") == 0);
+    assert(parse_request_line("GET HTTPS://x/ HTTP/1.1", &req) == 0);
+    assert(parse_request_line("CONNECT example.com:443 HTTP/1.1", &req) == 0);
     assert(parse_request_line("GET / FTP/1.1", &req) == -1);            /* HTTP/로 시작 안 함 */
     assert(parse_request_line("GET / ", &req) == -1);                   /* 버전 칸이 빔 */
 

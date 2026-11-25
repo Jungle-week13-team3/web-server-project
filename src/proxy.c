@@ -22,7 +22,7 @@
 static int is_hop_by_hop(const char *name)
 {
     static const char *names[] = { "Connection", "Keep-Alive", "Proxy-Connection",
-                                   "TE", "Upgrade", "Expect" };
+                                   "Proxy-Authorization", "TE", "Upgrade", "Expect" };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (strcasecmp(name, names[i]) == 0)
             return 1;
@@ -111,6 +111,14 @@ int load_route_file(const char *path, struct proxy_table *table)
     int line_no = 0;
     while (fgets(line, sizeof(line), fp) != NULL) {
         line_no++;
+        int fw = parse_forward_line(line, table); /* "forward ..." 줄이면 여기서 처리 */
+        if (fw < 0) {
+            fprintf(stderr, "%s:%d: bad forward line\n", path, line_no);
+            fclose(fp);
+            return -1;
+        }
+        if (fw == 1)
+            continue;
         struct proxy_route route;
         int rc = parse_route_line(line, &route);
         if (rc == ROUTE_LINE_SKIP)
@@ -287,37 +295,22 @@ static int relay_response(int backend_fd, int connfd, char *head, int *keep_aliv
     return status;
 }
 
-/* 요청을 규칙에 맞는 뒤 서버로 넘기고 응답을 클라에 전달한다.
- * 뒤 서버를 Round-Robin으로 고르고, 접속이 안 되면 다음 서버를 시도한다.
+/* 이미 접속한 서버(backend_fd)에 요청을 uri로 보내고, 받은 응답을 클라에 전달한 뒤 backend_fd를 닫는다.
+ * 리버스·포워드 프록시가 같이 쓰는 중계 부분이다.
  * *sent가 1이면 응답을 이미 보냈다(상태 코드는 로그용). 0이면 부른 쪽이 돌려준 에러 코드로 답한다. */
-int serve_proxy(int connfd, struct proxy_route *route, const struct http_request *req,
-                int *keep_alive, int *sent)
+static int relay_through(int backend_fd, int connfd, const struct http_request *req,
+                         const char *uri, int *keep_alive, int *sent)
 {
-    *sent = 0;
-    char uri[HTTP_URI_MAX];
-    if (rewrite_uri(route, req->uri, uri, sizeof(uri)) < 0)
-        return 414;
-
     char *head = malloc(PROXY_HEAD_MAX);
-    if (head == NULL)
+    if (head == NULL) {
+        close(backend_fd);
         return 500;
+    }
     int head_len = build_backend_request(req, uri, head, PROXY_HEAD_MAX);
     if (head_len < 0) {
+        close(backend_fd);
         free(head);
         return 500;
-    }
-
-    /* 차례인 서버부터 시도하고, 죽어 있으면 다음 서버로 넘어간다 */
-    int backend_fd = -1;
-    for (int tries = 0; tries < route->backend_count && backend_fd < 0; tries++) {
-        const struct proxy_backend *b = &route->backends[pick_backend(route)];
-        backend_fd = connect_to_server(b->host, b->port);
-        if (backend_fd < 0)
-            fprintf(stderr, "proxy: backend %s:%s unavailable\n", b->host, b->port);
-    }
-    if (backend_fd < 0) {
-        free(head);
-        return 502; /* 뒤 서버가 전부 응답하지 않는다 */
     }
 
     /* 뒤 서버와 주고받는 읽기·쓰기 한 번마다 최대 대기 시간을 건다. 안 걸면 멈춘 뒤 서버가 작업 스레드를 영원히 붙잡는다 */
@@ -340,4 +333,154 @@ int serve_proxy(int connfd, struct proxy_route *route, const struct http_request
     close(backend_fd);
     free(head);
     return status;
+}
+
+/* [리버스 프록시] 요청을 규칙에 맞는 뒤 서버로 넘기고 응답을 클라에 전달한다.
+ * 뒤 서버를 Round-Robin으로 고르고, 접속이 안 되면 다음 서버를 시도한다.
+ * *sent가 1이면 응답을 이미 보냈다(상태 코드는 로그용). 0이면 부른 쪽이 돌려준 에러 코드로 답한다. */
+int serve_proxy(int connfd, struct proxy_route *route, const struct http_request *req,
+                int *keep_alive, int *sent)
+{
+    *sent = 0;
+    char uri[HTTP_URI_MAX];
+    if (rewrite_uri(route, req->uri, uri, sizeof(uri)) < 0)
+        return 414;
+
+    /* 차례인 서버부터 시도하고, 죽어 있으면 다음 서버로 넘어간다 */
+    int backend_fd = -1;
+    for (int tries = 0; tries < route->backend_count && backend_fd < 0; tries++) {
+        const struct proxy_backend *b = &route->backends[pick_backend(route)];
+        backend_fd = connect_to_server(b->host, b->port);
+        if (backend_fd < 0)
+            fprintf(stderr, "proxy: backend %s:%s unavailable\n", b->host, b->port);
+    }
+    if (backend_fd < 0)
+        return 502; /* 뒤 서버가 전부 응답하지 않는다 */
+    return relay_through(backend_fd, connfd, req, uri, keep_alive, sent);
+}
+
+/* 설정 파일 한 줄이 "forward 127.0.0.1 localhost"면 포워드 프록시를 켜고 허용 호스트를 table에 넣는다.
+ * forward 줄이면 1, 아니면 0(다른 규칙 줄), 형식이 틀리면 -1(호스트가 없거나 너무 많음). */
+int parse_forward_line(const char *line, struct proxy_table *table)
+{
+    while (*line == ' ' || *line == '\t')
+        line++;
+    if (strncmp(line, "forward", 7) != 0 || (line[7] != ' ' && line[7] != '\t'))
+        return 0;
+
+    const char *p = line + 7;
+    int added = 0;
+    for (;;) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0' || *p == '\r' || *p == '\n' || *p == '#')
+            break;
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            p++;
+        size_t len = (size_t)(p - start);
+        if (table->forward_host_count >= FORWARD_MAX_HOSTS || len >= PROXY_HOST_MAX)
+            return -1;
+        memcpy(table->forward_hosts[table->forward_host_count], start, len);
+        table->forward_hosts[table->forward_host_count][len] = '\0';
+        table->forward_host_count++;
+        added++;
+    }
+    if (added == 0) /* 허용 호스트 없이 켜면 아무 데나 열린다고 오해할 수 있어 막는다 */
+        return -1;
+    table->forward_enabled = 1;
+    return 1;
+}
+
+/* URI가 "http://"나 "https://"로 시작하는 전체 주소면 1. 포워드 프록시로 보낼 요청인지 가를 때 쓴다. */
+int is_absolute_uri(const char *uri)
+{
+    return strncasecmp(uri, "http://", 7) == 0 || strncasecmp(uri, "https://", 8) == 0;
+}
+
+/* 전체 주소 "http://127.0.0.1:9001/a?b=1"을 호스트 "127.0.0.1", 포트 "9001", 경로 "/a?b=1"로 나눈다.
+ * 포트가 없으면 80, 경로가 없으면 "/". 성공 0, 형식이 틀리면 ABSOLUTE_URI_BAD, https면 ABSOLUTE_URI_HTTPS. */
+int parse_absolute_uri(const char *uri, char *host, size_t host_cap, char *port, size_t port_cap,
+                       char *path, size_t path_cap)
+{
+    if (strncasecmp(uri, "https://", 8) == 0)
+        return ABSOLUTE_URI_HTTPS;
+    if (strncasecmp(uri, "http://", 7) != 0)
+        return ABSOLUTE_URI_BAD;
+
+    /* 주소 부분(authority)은 "http://" 뒤부터 '/'나 '?' 앞까지 */
+    const char *auth = uri + 7;
+    size_t auth_len = strcspn(auth, "/?");
+    const char *rest = auth + auth_len;
+    if (auth_len == 0 || memchr(auth, '@', auth_len) != NULL || auth[0] == '[')
+        return ABSOLUTE_URI_BAD; /* 빈 호스트, 사용자 정보("user@"), IPv6("[::1]")는 받지 않는다 */
+
+    const char *colon = memchr(auth, ':', auth_len);
+    size_t host_len = colon ? (size_t)(colon - auth) : auth_len;
+    if (host_len == 0 || host_len >= host_cap)
+        return ABSOLUTE_URI_BAD;
+    memcpy(host, auth, host_len);
+    host[host_len] = '\0';
+
+    if (colon) {
+        size_t port_len = auth_len - host_len - 1;
+        if (port_len == 0 || port_len >= port_cap)
+            return ABSOLUTE_URI_BAD;
+        for (size_t i = 0; i < port_len; i++) {
+            if (colon[1 + i] < '0' || colon[1 + i] > '9')
+                return ABSOLUTE_URI_BAD;
+        }
+        memcpy(port, colon + 1, port_len);
+        port[port_len] = '\0';
+    } else {
+        if (port_cap < 3)
+            return ABSOLUTE_URI_BAD;
+        snprintf(port, port_cap, "80");
+    }
+
+    /* 경로: 비었으면 "/", '?'로 시작하면 앞에 '/'를 붙인다 ("http://h?x" → "/?x") */
+    int n = snprintf(path, path_cap, "%s%s", rest[0] == '/' ? "" : "/", rest);
+    if (n < 0 || (size_t)n >= path_cap)
+        return ABSOLUTE_URI_BAD;
+    return 0;
+}
+
+/* host가 설정 파일의 forward 줄에 적힌 호스트면 1. 대소문자는 가리지 않는다. */
+int is_forward_allowed(const struct proxy_table *table, const char *host)
+{
+    if (table == NULL || !table->forward_enabled)
+        return 0;
+    for (int i = 0; i < table->forward_host_count; i++) {
+        if (strcasecmp(table->forward_hosts[i], host) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* [포워드 프록시] 클라가 적어 보낸 전체 주소의 서버에 직접 접속해 요청을 보내고, 응답을 클라에 전달한다.
+ * 리버스와 달리 목적지를 클라가 정한다. 그래서 허용 목록에 있는 호스트로만 보낸다.
+ * 꺼져 있거나 허용 안 된 호스트면 403, 주소 형식이 틀리면 400, https면 501, 접속 실패 502, 시간 초과 504. */
+int serve_forward_proxy(int connfd, const struct proxy_table *table, const struct http_request *req,
+                        int *keep_alive, int *sent)
+{
+    *sent = 0;
+    if (table == NULL || !table->forward_enabled)
+        return 403;
+
+    char host[PROXY_HOST_MAX], port[PROXY_PORT_MAX], path[HTTP_URI_MAX];
+    int rc = parse_absolute_uri(req->uri, host, sizeof(host), port, sizeof(port), path, sizeof(path));
+    if (rc == ABSOLUTE_URI_HTTPS)
+        return 501;
+    if (rc < 0)
+        return 400;
+    if (!is_forward_allowed(table, host))
+        return 403;
+
+    int backend_fd = connect_to_server(host, port); /* 이름이면 getaddrinfo가 DNS로 IP를 찾는다 */
+    if (backend_fd < 0) {
+        fprintf(stderr, "forward proxy: %s:%s unavailable\n", host, port);
+        return 502;
+    }
+    /* 서버에는 전체 주소가 아니라 경로만 보낸다. 서버 입장에선 보통 요청이다 */
+    return relay_through(backend_fd, connfd, req, path, keep_alive, sent);
 }

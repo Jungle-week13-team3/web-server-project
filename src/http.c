@@ -37,8 +37,15 @@ int parse_request_line(const char *line, struct http_request *req)
         copy_token(req->version, sizeof(req->version), sp2 + 1, strlen(sp2 + 1)) < 0)
         return -1;
 
-    /* 우리 서버는 경로("/...") 형식의 URI만 받는다 */
-    if (req->uri[0] != '/')
+    /* URI는 세 가지 모양만 받는다.
+     * 경로 "/index.html": 보통 요청
+     * 전체 주소 "http://host:port/path": 포워드 프록시에게 보내는 요청
+     * CONNECT의 "host:port": https 터널 요청 (지원하지 않지만 501로 답하려면 형식은 통과시킨다) */
+    int is_path = req->uri[0] == '/';
+    int is_absolute = strncasecmp(req->uri, "http://", 7) == 0 ||
+                      strncasecmp(req->uri, "https://", 8) == 0;
+    int is_connect = strcmp(req->method, "CONNECT") == 0;
+    if (!is_path && !is_absolute && !is_connect)
         return -1;
     /* 버전은 "HTTP/"로 시작해야 한다. 지원하는 버전인지는 decide_request_status가 본다 */
     if (strncmp(req->version, "HTTP/", 5) != 0)

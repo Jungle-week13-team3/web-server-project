@@ -89,12 +89,64 @@ static void test_build_backend_request(void)
     assert(build_backend_request(&req, "/cgi-bin/adder", small, sizeof(small)) == -1);
 }
 
+/* "forward ..." 줄로 포워드 프록시가 켜지고, 허용 호스트만 통과하는지 확인한다. */
+static void test_forward_line(void)
+{
+    struct proxy_table t;
+    memset(&t, 0, sizeof(t));
+    assert(is_forward_allowed(&t, "127.0.0.1") == 0);                      /* 기본은 꺼짐 */
+    assert(parse_forward_line("/api/ /cgi-bin/ h:1\n", &t) == 0);          /* 다른 규칙 줄 */
+    assert(parse_forward_line("forwarder x\n", &t) == 0);                  /* 비슷한 단어 */
+    assert(parse_forward_line("forward\n", &t) == 0);                      /* 뒤에 칸이 없음 */
+    assert(parse_forward_line("forward   \n", &t) == -1);                  /* 허용 호스트 없음 */
+    assert(t.forward_enabled == 0);
+
+    assert(parse_forward_line("forward 127.0.0.1 LocalHost  # 주석\n", &t) == 1);
+    assert(t.forward_enabled == 1 && t.forward_host_count == 2);
+    assert(is_forward_allowed(&t, "127.0.0.1") == 1);
+    assert(is_forward_allowed(&t, "localhost") == 1);                      /* 대소문자 무시 */
+    assert(is_forward_allowed(&t, "example.com") == 0);
+    assert(is_forward_allowed(NULL, "127.0.0.1") == 0);
+}
+
+/* 전체 주소를 호스트·포트·경로로 나누고, 틀린 주소와 https를 구분하는지 확인한다. */
+static void test_parse_absolute_uri(void)
+{
+    char host[64], port[8], path[64];
+
+    assert(is_absolute_uri("http://x/") == 1);
+    assert(is_absolute_uri("HTTPS://x/") == 1);
+    assert(is_absolute_uri("/index.html") == 0);
+
+    assert(parse_absolute_uri("http://127.0.0.1:9001/a?b=1", host, sizeof(host), port, sizeof(port),
+                              path, sizeof(path)) == 0);
+    assert(strcmp(host, "127.0.0.1") == 0 && strcmp(port, "9001") == 0 && strcmp(path, "/a?b=1") == 0);
+
+    assert(parse_absolute_uri("http://localhost", host, sizeof(host), port, sizeof(port), path,
+                              sizeof(path)) == 0);
+    assert(strcmp(host, "localhost") == 0 && strcmp(port, "80") == 0 && strcmp(path, "/") == 0);
+
+    assert(parse_absolute_uri("http://h?x=1", host, sizeof(host), port, sizeof(port), path,
+                              sizeof(path)) == 0);
+    assert(strcmp(path, "/?x=1") == 0);
+
+    assert(parse_absolute_uri("https://h/", host, sizeof(host), port, sizeof(port), path,
+                              sizeof(path)) == ABSOLUTE_URI_HTTPS);
+    const char *bad[] = { "http:///a", "http://:80/", "http://h:/", "http://h:8x/",
+                          "http://user@h/", "http://[::1]/", "ftp://h/" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        assert(parse_absolute_uri(bad[i], host, sizeof(host), port, sizeof(port), path,
+                                  sizeof(path)) == ABSOLUTE_URI_BAD);
+}
+
 int main(void)
 {
     test_parse_route_line();
     test_find_and_rewrite();
     test_pick_backend();
     test_build_backend_request();
+    test_forward_line();
+    test_parse_absolute_uri();
     printf("all proxy unit tests passed\n");
     return 0;
 }

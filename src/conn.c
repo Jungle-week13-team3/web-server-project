@@ -74,12 +74,16 @@ static void log_request(const struct http_request *req, int status)
 }
 
 /* 정상 요청을 URI 앞부분으로 갈래에 보내고 상태 코드를 돌려준다.
- * 프록시 규칙 → 뒤 서버, /cgi-bin/ → CGI, 그 외 → 정적 파일(GET만. 파일에 POST는 405).
+ * 전체 주소 → 포워드 프록시, 프록시 규칙 → 뒤 서버(리버스), /cgi-bin/ → CGI, 그 외 → 정적 파일(GET만. 파일에 POST는 405).
  * *sent는 갈래가 응답을 이미 보냈으면 1이다. 0이면 부른 쪽이 에러 응답을 보낸다.
  * 갈래가 연결을 유지할 수 없게 되면 *keep_alive를 0으로 바꾼다. */
 static int dispatch_request(int connfd, const struct server_config *config,
                             const struct http_request *req, int *keep_alive, int *sent)
 {
+    /* 전체 주소("http://...")로 온 요청 = 우리를 포워드 프록시로 쓰겠다는 요청 */
+    if (is_absolute_uri(req->uri))
+        return serve_forward_proxy(connfd, config->routes, req, keep_alive, sent);
+
     struct proxy_route *route = find_route(config->routes, req->uri);
     if (route != NULL)
         return serve_proxy(connfd, route, req, keep_alive, sent);

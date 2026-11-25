@@ -46,6 +46,7 @@ cat > "$ROUTES" <<EOF
 /dead/ / 127.0.0.1:$DEAD
 /failover/ /cgi-bin/ 127.0.0.1:$DEAD 127.0.0.1:$B1
 /hang/ / 127.0.0.1:$HANG
+forward 127.0.0.1
 EOF
 python3 -c "
 import socket, time
@@ -258,6 +259,29 @@ check "죽은 서버는 건너뛰고 다음 서버로" "200 200 " \
     "$(curl -s -o /dev/null -o /dev/null -w '%{http_code} ' "$URL/failover/adder?a=1&b=1" "$URL/failover/adder?a=2&b=2")"
 check "규칙 밖 경로는 앞 서버가 직접 처리" "same" "$(same_as_file /index.html index.html)"
 check_alive
+# --- 포워드 프록시: curl -x로 앞 서버를 프록시로 지정하면, curl이 전체 주소("GET http://...")로 요청한다 ---
+FP="http://$HOST:$PORT"
+check "포워드: 정적 파일 그대로" "same" \
+    "$(curl -s -x "$FP" -o "$ROOT/.fgot" "http://127.0.0.1:$B1/index.html"; cmp -s "$ROOT/.fgot" "$ROOT/index.html" && echo same)"
+check "포워드: GET CGI → 7" "7" "$(curl -s -x "$FP" "http://127.0.0.1:$B1/cgi-bin/adder?a=3&b=4")"
+check "포워드: POST CGI → 6" "6" "$(curl -s -x "$FP" -d 'a=10&b=-4' "http://127.0.0.1:$B2/cgi-bin/adder")"
+check "포워드: 3MB 바이너리 그대로" "same" \
+    "$(curl -s -x "$FP" -o "$ROOT/.fgot" "http://127.0.0.1:$B1/big.bin"; cmp -s "$ROOT/.fgot" "$ROOT/big.bin" && echo same)"
+check "포워드: 뒤 서버 로그에는 경로만 도착" "1" \
+    "$(curl -s -x "$FP" -o /dev/null "http://127.0.0.1:$B1/style.css?fwd=1"; grep -c 'GET /style.css?fwd=1 HTTP/1.1' /tmp/web-backend1.log)"
+check "포워드: 허용 안 된 호스트 → 403" "403" \
+    "$(curl -s -x "$FP" -o /dev/null -w '%{http_code}' "http://localhost:$B1/")"
+check "포워드: 죽은 서버 → 502" "502" \
+    "$(curl -s -x "$FP" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DEAD/")"
+check "포워드: 주소 형식 틀림 → 400" "400" "$(send_raw 'GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n')"
+check "포워드: https(CONNECT) → 501" "501" \
+    "$(curl -s -x "$FP" -o /dev/null -w '%{http_connect}' "https://127.0.0.1:$B1/")"
+check "포워드: 설정이 없는 서버 → 403" "403" \
+    "$(curl -s -x "http://$HOST:$B1" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$B2/")"
+check "포워드: 클라와는 keep-alive 유지" "1 0 " \
+    "$(curl -s -x "$FP" -o /dev/null -o /dev/null -w '%{num_connects} ' "http://127.0.0.1:$B1/" "http://127.0.0.1:$B2/")"
+check_alive
+
 # --- 9단계: 동시 처리 (스레드 풀) ---
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
