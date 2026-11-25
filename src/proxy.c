@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp, strncasecmp */
+#include <netinet/in.h>  /* IPPROTO_TCP */
+#include <netinet/tcp.h> /* TCP_NODELAY */
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -322,6 +324,9 @@ int serve_proxy(int connfd, struct proxy_route *route, const struct http_request
     struct timeval tv = { .tv_sec = BACKEND_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(backend_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(backend_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* 뒤 서버에도 요청 머리와 본문을 따로 쓰므로 Nagle을 끈다 (conn.c와 같은 이유) */
+    int one = 1;
+    setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     int status = 502;
     if (write_all(backend_fd, head, (size_t)head_len) == 0 &&

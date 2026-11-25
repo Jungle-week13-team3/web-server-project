@@ -1,15 +1,20 @@
 #include "conn.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <stdatomic.h> /* atomic_int: 스레드 사이에 안전한 변수 (C11) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <netinet/in.h>  /* IPPROTO_TCP */
+#include <netinet/tcp.h> /* TCP_NODELAY */
 
 #include "cgi.h"
 #include "http.h"
 #include "net.h"
+#include "pool.h"
 #include "proxy.h"
 #include "static.h"
 
@@ -31,6 +36,12 @@ void request_shutdown(void)
 int is_shutting_down(void)
 {
     return atomic_load(&shutting_down);
+}
+
+/* 큐에서 작업 스레드를 기다리는 다른 연결이 있으면 1. 있으면 keep-alive 연결이 스레드를 양보한다. */
+static int others_waiting(const struct server_config *config)
+{
+    return config->pool != NULL && pool_has_waiting(config->pool);
 }
 
 /* 에러 상태 코드를 받아 "404 Not Found" 같은 문구를 본문으로 한 text/plain 응답을 보낸다. */
@@ -157,8 +168,9 @@ static int handle_one_request(int connfd, struct line_reader *reader,
         }
     }
 
-    /* ⑤ 갈림길 → 응답. 서버가 꺼지는 중이면 이 응답을 마지막으로 연결을 닫는다 */
-    int keep_alive = wants_keep_alive(&req) && !is_shutting_down();
+    /* ⑤ 갈림길 → 응답. 이 응답을 마지막으로 연결을 닫는 경우:
+     * 서버가 꺼지는 중이거나, 큐에서 차례를 기다리는 다른 연결이 있을 때(스레드를 양보한다) */
+    int keep_alive = wants_keep_alive(&req) && !is_shutting_down() && !others_waiting(config);
     int sent = 0;
     status = dispatch_request(connfd, config, &req, &keep_alive, &sent);
     log_request(&req, status);
@@ -169,8 +181,30 @@ static int handle_one_request(int connfd, struct line_reader *reader,
     return keep_alive;
 }
 
-/* 연결 하나에서 요청을 반복 처리한다. 클라가 닫거나, 닫자고 하거나, 시간이 지나면 돌아온다.
- * 소켓을 닫는 건 부른 쪽(main)이 한다. */
+/* keep-alive 연결에서 다음 요청이 올 때까지 기다린다. 오면 1, 연결을 닫아야 하면 0.
+ * 그냥 read로 기다리면 작업 스레드가 최대 KEEP_ALIVE_TIMEOUT_SEC 동안 이 연결에 묶여, 큐의 다른 연결이 굶는다.
+ * 그래서 poll로 IDLE_CHECK_MS씩 끊어 기다리며, 그 사이 다른 연결이 기다리거나 서버가 꺼지는 중이면 양보하고 닫는다. */
+static int wait_for_next_request(struct line_reader *reader, const struct server_config *config)
+{
+    if (reader->start < reader->end) /* 다음 요청 바이트가 이미 버퍼에 와 있다 */
+        return 1;
+    int waited_ms = 0;
+    while (waited_ms < KEEP_ALIVE_TIMEOUT_SEC * 1000) {
+        struct pollfd p = { .fd = reader->fd, .events = POLLIN };
+        int rc = poll(&p, 1, IDLE_CHECK_MS);
+        if (rc > 0)
+            return 1; /* 데이터가 왔다(또는 클라가 닫았다. 그건 다음 read_line이 EOF로 알아챈다) */
+        if (rc < 0 && errno != EINTR)
+            return 0;
+        if (is_shutting_down() || others_waiting(config))
+            return 0;
+        waited_ms += IDLE_CHECK_MS;
+    }
+    return 0; /* 유휴 시간 초과 */
+}
+
+/* 연결 하나에서 요청을 반복 처리한다. 클라가 닫거나, 닫자고 하거나, 시간이 지나거나,
+ * 다른 연결에 스레드를 양보해야 하면 돌아온다. 소켓을 닫는 건 부른 쪽(main)이 한다. */
 void serve_connection(int connfd, const struct server_config *config)
 {
     /* 읽기·쓰기마다 최대 대기 시간을 건다. 가만히 있거나 응답을 안 받아 가는 클라가 작업 스레드를 붙잡지 못하게 한다 */
@@ -178,9 +212,14 @@ void serve_connection(int connfd, const struct server_config *config)
     setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    /* Nagle 알고리즘을 끈다. 켜 두면 응답 머리 뒤에 따로 쓴 본문이, 클라의 지연 ACK과 서로 기다리느라
+     * 약 40ms 늦게 나간다(keep-alive에서 요청마다 생긴다). 끄면 write한 즉시 보낸다 */
+    int one = 1;
+    setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
     /* reader는 연결이 끝날 때까지 하나를 계속 쓴다. 앞 요청 뒤에 붙어 온 다음 요청 바이트가 여기 남아 있을 수 있다 */
     struct line_reader reader;
     init_line_reader(&reader, connfd);
-    while (handle_one_request(connfd, &reader, config))
+    while (handle_one_request(connfd, &reader, config) && wait_for_next_request(&reader, config))
         ;
 }

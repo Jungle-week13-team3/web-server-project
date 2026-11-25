@@ -51,4 +51,19 @@ test: $(TEST_HTTP) $(TEST_STATIC) $(TEST_CGI) $(TEST_PROXY) $(TEST_POOL)
 clean:
 	rm -f $(TARGET) $(CGI_ADDER) $(TEST_HTTP) $(TEST_STATIC) $(TEST_CGI) $(TEST_PROXY) $(TEST_POOL)
 
-.PHONY: all clean test
+# 메모리 검사: AddressSanitizer(잘못된 메모리 접근·누수) + UBSan(정의되지 않은 동작)으로 다시 빌드해
+# 단위·기능 테스트를 전부 돌리고, 서버 로그에 검사기 보고가 하나라도 있으면 실패한다.
+# 끝나면 검사용 실행 파일을 지운다(다음 make는 일반 빌드).
+ASAN_FLAGS = -Wall -Wextra -g -fno-omit-frame-pointer -fsanitize=address,undefined
+SERVER_LOGS = /tmp/web-server-test.log /tmp/web-backend1.log /tmp/web-backend2.log /tmp/web-shutdown.log
+asan:
+	$(MAKE) clean
+	$(MAKE) all $(TEST_HTTP) $(TEST_STATIC) $(TEST_CGI) $(TEST_PROXY) $(TEST_POOL) CFLAGS="$(ASAN_FLAGS)"
+	./$(TEST_HTTP) && ./$(TEST_STATIC) && ./$(TEST_CGI) && ./$(TEST_PROXY) && ./$(TEST_POOL)
+	bash tests/integration.sh
+	@if grep -l 'Sanitizer\|runtime error' $(SERVER_LOGS); then \
+		echo "ASan: 위 로그에 검사기 보고가 있다"; exit 1; \
+	else echo "ASan: 메모리 오류·누수 보고 0건"; fi
+	$(MAKE) clean
+
+.PHONY: all clean test asan

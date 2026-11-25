@@ -78,6 +78,7 @@ int main(int argc, char **argv)
         .static_root = static_root,
         .cgi_dir = (argc >= 4) ? argv[3] : DEFAULT_CGI_DIR,
         .routes = NULL,
+        .pool = NULL,
     };
 
     // 규칙 파일을 줬으면 읽는다. 틀린 줄이 있으면 잘못 중계하기 전에 시작을 막는다
@@ -117,6 +118,7 @@ int main(int argc, char **argv)
     set_stop_signals_blocked(SIG_BLOCK);
     /* 작업 스레드들을 먼저 띄운다. 이제 main은 받기만 하고, 처리는 작업 스레드가 한다 */
     static struct thread_pool pool; /* 큐가 커서 스택 대신 전역 영역에 둔다 */
+    config.pool = &pool; /* keep-alive 연결이 "기다리는 연결이 있나" 볼 수 있게 */
     if (pool_start(&pool, handle_pool_job, &config) < 0)
         return 1;
     set_stop_signals_blocked(SIG_UNBLOCK);

@@ -39,5 +39,6 @@ int pool_start(struct thread_pool *pool, pool_handler handler, void *arg);
 void pool_submit(struct thread_pool *pool, const struct pool_job *job);
 int pool_take(struct thread_pool *pool, struct pool_job *job);
 void pool_stop(struct thread_pool *pool);
+int pool_has_waiting(struct thread_pool *pool);
 
 #endif

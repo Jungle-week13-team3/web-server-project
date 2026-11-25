@@ -279,6 +279,38 @@ slept=$(seq 4 | xargs -P 4 -I{} curl -s "$URL/cgi-bin/sleep.sh?n={}" | grep -c s
 t1=$(now_ms)
 check "1초짜리 CGI 4개 동시 → 2초 안에 끝" "4 fast" "$slept $( [ $((t1 - t0)) -lt 2000 ] && echo fast || echo "$((t1 - t0))ms")"
 
+# 기아 방지: 작업 스레드(8개)를 전부 keep-alive 연결이 붙잡고 있어도 새 클라가 기다리지 않아야 한다
+# ① 요청 하나 보내고 가만히 있는 keep-alive 연결 8개
+for fd in 10 11 12 13 14 15 16 17; do
+    eval "exec $fd<>/dev/tcp/$HOST/$PORT"
+    printf 'GET /style.css HTTP/1.1\r\nHost: x\r\n\r\n' >&$fd
+done
+sleep 0.3
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/")
+t1=$(now_ms)
+check "유휴 keep-alive 8개가 스레드를 쥐고 있어도 새 클라 즉시 응답" "200 fast" \
+    "$code $( [ $((t1 - t0)) -lt 1000 ] && echo fast || echo "$((t1 - t0))ms")"
+for fd in 10 11 12 13 14 15 16 17; do eval "exec $fd<&-"; done
+
+# ② 쉬지 않고 요청을 보내는 keep-alive 연결 8개. 각 curl이 1초짜리 CGI를 한 연결로 4번 연달아 받는다(4초 동안 바쁨).
+#    양보가 있으면 새 클라는 지금 도는 1초짜리만 끝나면 차례가 온다. 없으면 4초를 다 기다린다
+BUSY_URLS=$(for i in 1 2 3 4; do printf '%s/cgi-bin/sleep.sh?b=%d ' "$URL" "$i"; done)
+BUSY_PIDS=""
+for i in 1 2 3 4 5 6 7 8; do
+    curl -s $BUSY_URLS > /dev/null &
+    BUSY_PIDS="$BUSY_PIDS $!"
+done
+sleep 0.3
+t0=$(now_ms)
+code=$(curl -s -o /dev/null -w '%{http_code}' "$URL/")
+t1=$(now_ms)
+check "바쁜 keep-alive 8개 사이에서도 새 클라가 2.5초 안에 응답" "200 fast" \
+    "$code $( [ $((t1 - t0)) -lt 2500 ] && echo fast || echo "$((t1 - t0))ms")"
+busy_fail=0
+for p in $BUSY_PIDS; do wait $p || busy_fail=$((busy_fail + 1)); done
+check "  └ 양보당한 연결들도 요청을 다 마침 (curl 실패 0)" "0" "$busy_fail"
+
 # 동시에 들어온 프록시 요청 40개도 잠금 덕분에 정확히 20/20으로 나뉘어야 한다
 before1=$(grep -c 'adder?a=77' /tmp/web-backend1.log)
 before2=$(grep -c 'adder?a=77' /tmp/web-backend2.log)

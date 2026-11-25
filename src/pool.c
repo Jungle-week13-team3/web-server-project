@@ -74,6 +74,15 @@ int pool_take(struct thread_pool *pool, struct pool_job *job)
     return 0;
 }
 
+/* 큐에서 처리를 기다리는 연결이 있으면 1. 작업 스레드가 keep-alive 연결을 계속 붙잡을지 정할 때 본다. */
+int pool_has_waiting(struct thread_pool *pool)
+{
+    pthread_mutex_lock(&pool->lock);
+    int waiting = pool->count > 0;
+    pthread_mutex_unlock(&pool->lock);
+    return waiting;
+}
+
 /* [main] 풀을 멈춘다. 큐에 남은 일감과 처리 중인 연결은 끝까지 처리하게 두고,
  * 모든 작업 스레드가 끝날 때까지 기다린 뒤 잠금을 정리한다. */
 void pool_stop(struct thread_pool *pool)
