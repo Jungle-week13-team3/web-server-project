@@ -1,15 +1,54 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -g
+LDLIBS  = -pthread # 스레드(pthread) 라이브러리. CFLAGS를 바꿔 빌드해도 빠지지 않게 따로 둔다
 TARGET  = server
 SRCS    = $(wildcard src/*.c)
-
 HDRS    = $(wildcard src/*.h)
+
+# 서버가 실행하는 테스트용 CGI 프로그램
+CGI_ADDER = cgi-bin/adder
+
+# 단위 테스트: 소켓 없이 http.c·static.c·cgi.c 함수만 불러 본다
+TEST_HTTP   = tests/unit/test_http
+TEST_STATIC = tests/unit/test_static
+TEST_CGI    = tests/unit/test_cgi
+TEST_PROXY  = tests/unit/test_proxy
+TEST_POOL   = tests/unit/test_pool
+
+# make만 치면 서버와 CGI 프로그램을 같이 만든다
+all: $(TARGET) $(CGI_ADDER)
 
 # 헤더(.h)가 바뀌어도 다시 빌드한다. 컴파일에는 .c만 넘긴다.
 $(TARGET): $(SRCS) $(HDRS)
-	$(CC) $(CFLAGS) -o $@ $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDLIBS)
+
+$(CGI_ADDER): cgi-bin/adder.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(TEST_HTTP): tests/unit/test_http.c src/http.c src/http.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/unit/test_http.c src/http.c
+
+# static.c가 http.c(응답 머리)와 net.c(write_all)를 부르므로 같이 링크한다
+$(TEST_STATIC): tests/unit/test_static.c src/static.c src/static.h src/http.c src/net.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/unit/test_static.c src/static.c src/http.c src/net.c
+
+$(TEST_CGI): tests/unit/test_cgi.c src/cgi.c src/cgi.h src/http.c src/net.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/unit/test_cgi.c src/cgi.c src/http.c src/net.c
+
+$(TEST_PROXY): tests/unit/test_proxy.c src/proxy.c src/proxy.h src/http.c src/net.c
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/unit/test_proxy.c src/proxy.c src/http.c src/net.c $(LDLIBS)
+
+$(TEST_POOL): tests/unit/test_pool.c src/pool.c src/pool.h
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/unit/test_pool.c src/pool.c $(LDLIBS)
+
+test: $(TEST_HTTP) $(TEST_STATIC) $(TEST_CGI) $(TEST_PROXY) $(TEST_POOL)
+	./$(TEST_HTTP)
+	./$(TEST_STATIC)
+	./$(TEST_CGI)
+	./$(TEST_PROXY)
+	./$(TEST_POOL)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(CGI_ADDER) $(TEST_HTTP) $(TEST_STATIC) $(TEST_CGI) $(TEST_PROXY) $(TEST_POOL)
 
-.PHONY: clean
+.PHONY: all clean test
