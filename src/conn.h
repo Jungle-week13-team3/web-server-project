@@ -4,6 +4,7 @@
 /* 연결 하나를 맡아 요청을 반복해서 처리한다 (keep-alive). */
 
 #define KEEP_ALIVE_TIMEOUT_SEC 5 /* 다음 요청을 기다리는 최대 시간. 넘으면 연결을 닫는다 */
+#define REQUEST_TIMEOUT_SEC    5 /* 요청 하나(요청 줄+헤더+본문)를 다 받기까지의 최대 시간. 넘으면 408. 느린 요청(Slowloris) 방어 */
 
 struct proxy_table;
 struct thread_pool;

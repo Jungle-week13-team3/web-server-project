@@ -178,6 +178,7 @@ const char *get_status_reason(int status)
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
     case 500: return "Internal Server Error";

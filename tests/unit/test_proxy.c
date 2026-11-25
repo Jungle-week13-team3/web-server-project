@@ -89,24 +89,27 @@ static void test_build_backend_request(void)
     assert(build_backend_request(&req, "/cgi-bin/adder", small, sizeof(small)) == -1);
 }
 
-/* "forward ..." 줄로 포워드 프록시가 켜지고, 허용 호스트만 통과하는지 확인한다. */
+/* "forward ..." 줄로 포워드 프록시가 켜지고, 호스트:포트가 정확히 맞는 대상만 통과하는지 확인한다. */
 static void test_forward_line(void)
 {
     struct proxy_table t;
     memset(&t, 0, sizeof(t));
-    assert(is_forward_allowed(&t, "127.0.0.1") == 0);                      /* 기본은 꺼짐 */
+    assert(is_forward_allowed(&t, "127.0.0.1", "80") == 0);                /* 기본은 꺼짐 */
     assert(parse_forward_line("/api/ /cgi-bin/ h:1\n", &t) == 0);          /* 다른 규칙 줄 */
     assert(parse_forward_line("forwarder x\n", &t) == 0);                  /* 비슷한 단어 */
     assert(parse_forward_line("forward\n", &t) == 0);                      /* 뒤에 칸이 없음 */
-    assert(parse_forward_line("forward   \n", &t) == -1);                  /* 허용 호스트 없음 */
+    assert(parse_forward_line("forward   \n", &t) == -1);                  /* 허용 대상 없음 */
+    assert(parse_forward_line("forward 127.0.0.1\n", &t) == -1);           /* 포트 없는 호스트는 거부(SSRF 방지) */
     assert(t.forward_enabled == 0);
 
-    assert(parse_forward_line("forward 127.0.0.1 LocalHost  # 주석\n", &t) == 1);
-    assert(t.forward_enabled == 1 && t.forward_host_count == 2);
-    assert(is_forward_allowed(&t, "127.0.0.1") == 1);
-    assert(is_forward_allowed(&t, "localhost") == 1);                      /* 대소문자 무시 */
-    assert(is_forward_allowed(&t, "example.com") == 0);
-    assert(is_forward_allowed(NULL, "127.0.0.1") == 0);
+    assert(parse_forward_line("forward 127.0.0.1:9001 LocalHost:80  # 주석\n", &t) == 1);
+    assert(t.forward_enabled == 1 && t.forward_dest_count == 2);
+    assert(is_forward_allowed(&t, "127.0.0.1", "9001") == 1);
+    assert(is_forward_allowed(&t, "localhost", "80") == 1);                /* 호스트 대소문자 무시 */
+    assert(is_forward_allowed(&t, "127.0.0.1", "22") == 0);               /* 허용 호스트라도 다른 포트는 차단 */
+    assert(is_forward_allowed(&t, "127.0.0.1", "9002") == 0);
+    assert(is_forward_allowed(&t, "example.com", "80") == 0);
+    assert(is_forward_allowed(NULL, "127.0.0.1", "9001") == 0);
 }
 
 /* 전체 주소를 호스트·포트·경로로 나누고, 틀린 주소와 https를 구분하는지 확인한다. */

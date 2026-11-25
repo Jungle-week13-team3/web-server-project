@@ -110,10 +110,16 @@ static int handle_one_request(int connfd, struct line_reader *reader,
     char line[LINE_READER_BUF_SIZE];
     int status = 0; /* 0 = 아직 정하지 않음 */
 
+    /* 요청을 받기 시작하는 지금부터 REQUEST_TIMEOUT_SEC 안에 요청 전체가 와야 한다.
+     * 이게 없으면 느린 요청(한 글자씩 보내기)이 워커를 영원히 붙잡는다 */
+    set_line_reader_deadline(reader, REQUEST_TIMEOUT_SEC);
+
     /* ① 요청 줄 */
     ssize_t n = read_line(reader, line, sizeof(line));
     if (n == READ_LINE_TOO_LONG) {
         status = 414; /* 요청 줄이 8KB를 넘는 건 거의 항상 URI가 길어서다 */
+    } else if (n == READ_LINE_TIMEOUT) {
+        status = 408; /* 요청을 제한 시간 안에 다 안 보냄 (느린 요청) */
     } else if (n < 0) {
         /* 클라가 다 쓰고 닫았거나, 읽기 오류거나, 다음 요청을 기다리다 시간이 지났다. 답할 것 없이 닫는다 */
         return 0;
@@ -132,7 +138,11 @@ static int handle_one_request(int connfd, struct line_reader *reader,
             status = 400;
             break;
         }
-        if (n < 0) /* 헤더 도중에 끊기거나 시간이 지남 (불완전한 요청) */
+        if (n == READ_LINE_TIMEOUT) { /* 헤더를 제한 시간 안에 다 안 보냄 (느린 요청) */
+            status = 408;
+            break;
+        }
+        if (n < 0) /* 헤더 도중에 끊김 (불완전한 요청) */
             return 0;
         if (n == 0) /* 빈 줄 = 헤더 끝 */
             break;

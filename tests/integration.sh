@@ -46,7 +46,7 @@ cat > "$ROUTES" <<EOF
 /dead/ / 127.0.0.1:$DEAD
 /failover/ /cgi-bin/ 127.0.0.1:$DEAD 127.0.0.1:$B1
 /hang/ / 127.0.0.1:$HANG
-forward 127.0.0.1
+forward 127.0.0.1:$B1 127.0.0.1:$B2 127.0.0.1:$DEAD
 EOF
 python3 -c "
 import socket, time
@@ -217,6 +217,31 @@ idle=$(idle_close_seconds)
 check "가만히 있는 연결 → 4~6초 뒤 서버가 닫음" "ok" "$( [ "$idle" -ge 4 ] && [ "$idle" -le 6 ] && echo ok || echo "${idle}s")"
 check_alive
 
+# Slowloris 방어: 느린 연결 12개가 헤더를 '한 줄씩 천천히'(2초 간격) 보내 요청을 안 끝낸다.
+# 이러면 읽기 한 번당 제한(SO_RCVTIMEO 5초)이 계속 갱신돼 풀리지 않는다. 요청 전체 시간 제한이 없으면
+# 워커가 영원히 묶여 정상 사용자가 완전히 막힌다(=000). 제한이 있으면 워커가 그 시각에 풀려 정상 사용자가 응답을 받는다.
+python3 - "$HOST" "$PORT" <<'EOF' &
+import socket, sys, time
+conns = []
+for _ in range(12):
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])))
+    s.sendall(b'GET / HTTP/1.1\r\n')
+    conns.append(s)
+for _ in range(6):          # 12초 동안 2초마다 헤더 한 줄씩 흘려보낸다 (읽기 제한 갱신)
+    time.sleep(2)
+    for s in conns:
+        try: s.sendall(b'X-a: b\r\n')
+        except OSError: pass
+EOF
+SLOW_PID=$!
+sleep 0.5
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 11 "$URL/")
+check "한 글자씩 흘리는 느린 연결 12개 중에도 정상 사용자 응답 (Slowloris 방어)" "200" "$code"
+# 참고: 지속 공격에서 정상 요청 지연은 중앙값 약 1초, 최대 약 5.5초(한 시간 제한 주기). 제한이 없으면 무응답=000.
+kill $SLOW_PID 2>/dev/null
+wait $SLOW_PID 2>/dev/null
+check_alive
+
 # --- 7단계: CGI ---
 check "GET adder?a=3&b=4 → 7" "7" "$(curl -s "$URL/cgi-bin/adder?a=3&b=4")"
 check "POST adder 본문 a=10&b=-4 → 6" "6" "$(curl -s -d 'a=10&b=-4' "$URL/cgi-bin/adder")"
@@ -271,8 +296,12 @@ check "포워드: 뒤 서버 로그에는 경로만 도착" "1" \
     "$(curl -s -x "$FP" -o /dev/null "http://127.0.0.1:$B1/style.css?fwd=1"; grep -c 'GET /style.css?fwd=1 HTTP/1.1' /tmp/web-backend1.log)"
 check "포워드: 허용 안 된 호스트 → 403" "403" \
     "$(curl -s -x "$FP" -o /dev/null -w '%{http_code}' "http://localhost:$B1/")"
-check "포워드: 죽은 서버 → 502" "502" \
+check "포워드: 죽은 서버(허용 목록에 있음) → 502" "502" \
     "$(curl -s -x "$FP" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$DEAD/")"
+# SSRF 방어: 허용 호스트라도 허용 안 된 포트로는 중계 안 함. $HANG에 살아 있는 서버가 있어도 403.
+# (고치기 전에는 임의 포트로 연결돼 502/200이 포트스캐너가 됐다)
+check "포워드: 허용 호스트의 비허용 포트 → 403 (SSRF 차단)" "403" \
+    "$(curl -s -x "$FP" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HANG/")"
 check "포워드: 주소 형식 틀림 → 400" "400" "$(send_raw 'GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n')"
 check "포워드: https(CONNECT) → 501" "501" \
     "$(curl -s -x "$FP" -o /dev/null -w '%{http_connect}' "https://127.0.0.1:$B1/")"

@@ -359,8 +359,9 @@ int serve_proxy(int connfd, struct proxy_route *route, const struct http_request
     return relay_through(backend_fd, connfd, req, uri, keep_alive, sent);
 }
 
-/* 설정 파일 한 줄이 "forward 127.0.0.1 localhost"면 포워드 프록시를 켜고 허용 호스트를 table에 넣는다.
- * forward 줄이면 1, 아니면 0(다른 규칙 줄), 형식이 틀리면 -1(호스트가 없거나 너무 많음). */
+/* 설정 파일 한 줄이 "forward 127.0.0.1:9001 127.0.0.1:9002"면 포워드 프록시를 켜고 허용 대상을 table에 넣는다.
+ * 각 대상은 반드시 '호스트:포트' 형식이어야 한다. 포트를 안 적으면 임의 포트로 열려 SSRF가 되므로 거부한다.
+ * forward 줄이면 1, 아니면 0(다른 규칙 줄), 형식이 틀리면 -1(대상이 없거나·형식 오류·너무 많음). */
 int parse_forward_line(const char *line, struct proxy_table *table)
 {
     while (*line == ' ' || *line == '\t')
@@ -379,14 +380,15 @@ int parse_forward_line(const char *line, struct proxy_table *table)
         while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
             p++;
         size_t len = (size_t)(p - start);
-        if (table->forward_host_count >= FORWARD_MAX_HOSTS || len >= PROXY_HOST_MAX)
+        if (table->forward_dest_count >= FORWARD_MAX_HOSTS)
             return -1;
-        memcpy(table->forward_hosts[table->forward_host_count], start, len);
-        table->forward_hosts[table->forward_host_count][len] = '\0';
-        table->forward_host_count++;
+        /* 리버스 프록시의 뒤 서버 주소와 같은 '호스트:포트' 파서를 쓴다. 포트가 없으면 여기서 실패한다 */
+        if (parse_backend(start, len, &table->forward_dests[table->forward_dest_count]) < 0)
+            return -1;
+        table->forward_dest_count++;
         added++;
     }
-    if (added == 0) /* 허용 호스트 없이 켜면 아무 데나 열린다고 오해할 수 있어 막는다 */
+    if (added == 0) /* 허용 대상 없이 켜면 아무 데나 열린다고 오해할 수 있어 막는다 */
         return -1;
     table->forward_enabled = 1;
     return 1;
@@ -445,13 +447,15 @@ int parse_absolute_uri(const char *uri, char *host, size_t host_cap, char *port,
     return 0;
 }
 
-/* host가 설정 파일의 forward 줄에 적힌 호스트면 1. 대소문자는 가리지 않는다. */
-int is_forward_allowed(const struct proxy_table *table, const char *host)
+/* host:port가 설정 파일의 forward 줄에 적힌 대상과 정확히 맞으면 1.
+ * 호스트는 대소문자를 안 가리고, 포트는 정확히 같아야 한다. 포트까지 봐야 허용 호스트의 다른 포트로 새는 SSRF를 막는다. */
+int is_forward_allowed(const struct proxy_table *table, const char *host, const char *port)
 {
     if (table == NULL || !table->forward_enabled)
         return 0;
-    for (int i = 0; i < table->forward_host_count; i++) {
-        if (strcasecmp(table->forward_hosts[i], host) == 0)
+    for (int i = 0; i < table->forward_dest_count; i++) {
+        if (strcasecmp(table->forward_dests[i].host, host) == 0 &&
+            strcmp(table->forward_dests[i].port, port) == 0)
             return 1;
     }
     return 0;
@@ -473,7 +477,7 @@ int serve_forward_proxy(int connfd, const struct proxy_table *table, const struc
         return 501;
     if (rc < 0)
         return 400;
-    if (!is_forward_allowed(table, host))
+    if (!is_forward_allowed(table, host, port)) /* 호스트:포트가 허용 목록과 정확히 맞아야 한다 */
         return 403;
 
     int backend_fd = connect_to_server(host, port); /* 이름이면 getaddrinfo가 DNS로 IP를 찾는다 */

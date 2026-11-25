@@ -37,11 +37,12 @@ struct proxy_route {
 struct proxy_table {
     struct proxy_route routes[PROXY_MAX_ROUTES];
     int count;
-    /* 포워드 프록시: 설정 파일에 "forward 127.0.0.1 localhost" 줄이 있으면 켜진다.
-     * 아무 곳에나 중계하면 남이 우리 서버를 거쳐 다른 곳을 공격할 수 있어서, 적힌 호스트로만 보낸다 */
+    /* 포워드 프록시: 설정 파일에 "forward 127.0.0.1:9001 127.0.0.1:9002" 줄이 있으면 켜진다.
+     * 호스트만 보고 포트를 안 보면, 허용 호스트의 임의 포트(예: 로컬 전용 DB·redis)로 중계돼 SSRF가 된다.
+     * 그래서 '호스트:포트' 쌍을 그대로 적고, 그 쌍과 정확히 맞는 요청만 중계한다 */
     int forward_enabled;
-    char forward_hosts[FORWARD_MAX_HOSTS][PROXY_HOST_MAX];
-    int forward_host_count;
+    struct proxy_backend forward_dests[FORWARD_MAX_HOSTS];
+    int forward_dest_count;
 };
 
 /* parse_absolute_uri가 0(성공) 대신 돌려주는 값 */
@@ -67,7 +68,7 @@ int parse_forward_line(const char *line, struct proxy_table *table);
 int is_absolute_uri(const char *uri);
 int parse_absolute_uri(const char *uri, char *host, size_t host_cap, char *port, size_t port_cap,
                        char *path, size_t path_cap);
-int is_forward_allowed(const struct proxy_table *table, const char *host);
+int is_forward_allowed(const struct proxy_table *table, const char *host, const char *port);
 int serve_forward_proxy(int connfd, const struct proxy_table *table, const struct http_request *req,
                         int *keep_alive, int *sent);
 

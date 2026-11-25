@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <poll.h>     /* poll: 시간 제한 안에서 읽기 가능해지길 기다림 */
 #include <sys/time.h> /* struct timeval: 읽기 타임아웃 */
 #include <time.h>
 #include <unistd.h>
@@ -126,12 +127,41 @@ int write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-/* reader가 fd에서 읽도록 준비한다. 버퍼는 비어 있는 상태로 시작한다. */
+/* reader가 fd에서 읽도록 준비한다. 버퍼는 비어 있는 상태로 시작한다. 시간 제한은 없음(0). */
 void init_line_reader(struct line_reader *reader, int fd)
 {
     reader->fd = fd;
     reader->start = 0;
     reader->end = 0;
+    reader->deadline = 0;
+}
+
+/* 지금부터 seconds초 뒤를 읽기 시간 제한으로 건다. seconds<=0이면 제한을 푼다.
+ * 요청 하나를 받기 시작할 때 걸면, 느린 요청이 워커를 영원히 붙잡지 못하고 그 시각에 끊긴다. */
+void set_line_reader_deadline(struct line_reader *reader, int seconds)
+{
+    reader->deadline = seconds > 0 ? time(NULL) + seconds : 0;
+}
+
+/* deadline까지 fd가 읽기 가능해질 때까지 기다린다. deadline==0이면 제한 없이 바로 1(블로킹 read에 맡긴다).
+ * 준비됨 1, 시간 초과 0, 오류 -1. */
+static int wait_readable(int fd, time_t deadline)
+{
+    if (deadline == 0)
+        return 1;
+    for (;;) {
+        time_t now = time(NULL);
+        if (now >= deadline)
+            return 0;
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int rc = poll(&p, 1, (int)((deadline - now) * 1000));
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        return rc > 0 ? 1 : 0;
+    }
 }
 
 /* 한 줄을 읽어 out에 넣는다. 줄 끝의 "\r\n"(또는 "\n")은 빼고, 끝에 '\0'을 붙인다.
@@ -143,6 +173,11 @@ ssize_t read_line(struct line_reader *reader, char *out, size_t cap)
     for (;;) {
         /* 받아 둔 바이트를 다 꺼냈으면 소켓에서 새로 받아 온다 */
         if (reader->start == reader->end) {
+            int ready = wait_readable(reader->fd, reader->deadline);
+            if (ready == 0) /* 요청 전체 시간 제한 초과: 느린 요청이다 */
+                return READ_LINE_TIMEOUT;
+            if (ready < 0)
+                return READ_LINE_ERROR;
             ssize_t n = read(reader->fd, reader->buf, sizeof(reader->buf));
             if (n < 0) {
                 if (errno == EINTR)
@@ -178,12 +213,24 @@ ssize_t read_buffered_exact(struct line_reader *reader, void *buf, size_t len)
     memcpy(buf, reader->buf + reader->start, from_buffer);
     reader->start += from_buffer;
 
-    if (from_buffer == len)
-        return (ssize_t)len;
-    ssize_t n = read_exact(reader->fd, (char *)buf + from_buffer, len - from_buffer);
-    if (n < 0)
-        return -1;
-    return (ssize_t)from_buffer + n;
+    /* 모자란 만큼 소켓에서 더 읽는다. deadline이 지나면 짧게 반환해서(호출부가 실패 처리) 느린 본문이 워커를 안 붙잡게 한다 */
+    size_t got = from_buffer;
+    char *p = buf;
+    while (got < len) {
+        int ready = wait_readable(reader->fd, reader->deadline);
+        if (ready <= 0) /* 시간 초과 또는 오류 */
+            return (ssize_t)got;
+        ssize_t n = read(reader->fd, p + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) /* EOF: 상대가 중간에 닫았다 */
+            break;
+        got += (size_t)n;
+    }
+    return (ssize_t)got;
 }
 
 /* reader에서 최대 cap바이트를 한 번 읽는다. 버퍼에 남은 게 있으면 그것을, 없으면 소켓에서 read 한 번.
