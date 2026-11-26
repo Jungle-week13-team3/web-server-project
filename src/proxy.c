@@ -1,0 +1,490 @@
+#include "proxy.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h> /* strcasecmp, strncasecmp */
+#include <netinet/in.h>  /* IPPROTO_TCP */
+#include <netinet/tcp.h> /* TCP_NODELAY */
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include "net.h"
+
+#define PROXY_HEAD_MAX (80 * 1024) /* 요청·응답 머리를 담는 버퍼. 헤더 32개 × 2KB를 넘게 잡는다 */
+#define PROXY_COPY_BUF 8192
+
+/* 홉(hop) 하나에만 해당하는 헤더인지 본다. 연결 방식은 클라↔프록시, 프록시↔뒤 서버가 따로 정하므로 넘기지 않는다.
+ * Expect는 프록시가 본문을 이미 다 받아 둔 뒤라서 뒤 서버에 넘길 이유가 없다. */
+static int is_hop_by_hop(const char *name)
+{
+    static const char *names[] = { "Connection", "Keep-Alive", "Proxy-Connection",
+                                   "Proxy-Authorization", "TE", "Upgrade", "Expect" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcasecmp(name, names[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* "127.0.0.1:9001"을 host와 port로 나눠 backend에 넣는다. 성공 0, 형식이 틀리면 -1. */
+static int parse_backend(const char *text, size_t len, struct proxy_backend *backend)
+{
+    const char *colon = memchr(text, ':', len);
+    if (colon == NULL)
+        return -1;
+    size_t host_len = (size_t)(colon - text);
+    size_t port_len = len - host_len - 1;
+    if (host_len == 0 || host_len >= sizeof(backend->host) ||
+        port_len == 0 || port_len >= sizeof(backend->port))
+        return -1;
+    for (size_t i = 0; i < port_len; i++) {
+        if (colon[1 + i] < '0' || colon[1 + i] > '9')
+            return -1;
+    }
+    memcpy(backend->host, text, host_len);
+    backend->host[host_len] = '\0';
+    memcpy(backend->port, colon + 1, port_len);
+    backend->port[port_len] = '\0';
+    return 0;
+}
+
+/* 설정 파일 한 줄 "/api/ /cgi-bin/ 127.0.0.1:9001 127.0.0.1:9002"를 route에 채운다.
+ * 칸은 공백으로 나뉜다: 앞부분, 바꿀 앞부분, 뒤 서버 1개 이상.
+ * 성공 ROUTE_LINE_OK, 빈 줄·주석이면 ROUTE_LINE_SKIP, 틀리면 ROUTE_LINE_ERROR. */
+int parse_route_line(const char *line, struct proxy_route *route)
+{
+    memset(route, 0, sizeof(*route));
+    const char *p = line;
+    int field = 0;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+            p++;
+        if (*p == '\0')
+            break;
+        if (*p == '#') {
+            if (field == 0)
+                return ROUTE_LINE_SKIP;
+            break; /* 줄 끝 주석 */
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            p++;
+        size_t len = (size_t)(p - start);
+
+        if (field == 0 || field == 1) {
+            char *dst = (field == 0) ? route->prefix : route->rewrite;
+            if (start[0] != '/' || len >= PROXY_PREFIX_MAX)
+                return ROUTE_LINE_ERROR;
+            memcpy(dst, start, len);
+            dst[len] = '\0';
+        } else {
+            if (route->backend_count >= PROXY_MAX_BACKENDS ||
+                parse_backend(start, len, &route->backends[route->backend_count]) < 0)
+                return ROUTE_LINE_ERROR;
+            route->backend_count++;
+        }
+        field++;
+    }
+
+    if (field == 0)
+        return ROUTE_LINE_SKIP;
+    if (route->backend_count == 0) /* 앞부분, 바꿀 앞부분, 뒤 서버까지 다 있어야 한다 */
+        return ROUTE_LINE_ERROR;
+    return ROUTE_LINE_OK;
+}
+
+/* 설정 파일을 한 줄씩 읽어 table에 규칙을 채운다. 성공 0, 파일을 못 열거나 틀린 줄이 있으면 -1(줄 번호를 출력). */
+int load_route_file(const char *path, struct proxy_table *table)
+{
+    memset(table, 0, sizeof(*table));
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        perror(path);
+        return -1;
+    }
+    char line[1024];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line_no++;
+        int fw = parse_forward_line(line, table); /* "forward ..." 줄이면 여기서 처리 */
+        if (fw < 0) {
+            fprintf(stderr, "%s:%d: bad forward line\n", path, line_no);
+            fclose(fp);
+            return -1;
+        }
+        if (fw == 1)
+            continue;
+        struct proxy_route route;
+        int rc = parse_route_line(line, &route);
+        if (rc == ROUTE_LINE_SKIP)
+            continue;
+        if (rc == ROUTE_LINE_ERROR || table->count >= PROXY_MAX_ROUTES) {
+            fprintf(stderr, "%s:%d: bad route line\n", path, line_no);
+            fclose(fp);
+            return -1;
+        }
+        table->routes[table->count++] = route;
+    }
+    fclose(fp);
+    return 0;
+}
+
+/* URI가 앞부분으로 시작하는 첫 규칙을 돌려준다. 맞는 규칙이 없으면 NULL. */
+struct proxy_route *find_route(struct proxy_table *table, const char *uri)
+{
+    if (table == NULL)
+        return NULL;
+    for (int i = 0; i < table->count; i++) {
+        const char *prefix = table->routes[i].prefix;
+        if (strncmp(uri, prefix, strlen(prefix)) == 0)
+            return &table->routes[i];
+    }
+    return NULL;
+}
+
+/* URI의 앞부분을 바꿔 out에 쓴다. "/api/adder?a=1" → "/cgi-bin/adder?a=1". 성공 0, out이 모자라면 -1. */
+int rewrite_uri(const struct proxy_route *route, const char *uri, char *out, size_t cap)
+{
+    int n = snprintf(out, cap, "%s%s", route->rewrite, uri + strlen(route->prefix));
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return 0;
+}
+
+/* Round-Robin 순번을 지키는 잠금. 모든 규칙이 같이 쓴다(순번 바꾸기는 아주 짧아서 하나로 충분하다) */
+static pthread_mutex_t rr_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Round-Robin: 뒤 서버를 순서대로 하나씩 돌아가며 고른다. 고른 번호를 돌려준다.
+ * 작업 스레드 여럿이 동시에 부르므로 잠그고 바꾼다. 안 잠그면 두 스레드가 같은 번호를 받을 수 있다. */
+int pick_backend(struct proxy_route *route)
+{
+    pthread_mutex_lock(&rr_lock);
+    int index = route->next;
+    route->next = (route->next + 1) % route->backend_count;
+    pthread_mutex_unlock(&rr_lock);
+    return index;
+}
+
+/* 뒤 서버에 보낼 요청 머리를 out에 만든다. 요청 줄은 바꾼 uri로, 헤더는 홉 헤더만 빼고 그대로,
+ * 마지막에 "Connection: close"를 붙인다(뒤 서버와는 요청 하나마다 연결을 새로 연다). 만든 길이, 모자라면 -1. */
+int build_backend_request(const struct http_request *req, const char *uri, char *out, size_t cap)
+{
+    size_t used = 0;
+    int n = snprintf(out, cap, "%s %s HTTP/1.1\r\n", req->method, uri);
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    used = (size_t)n;
+
+    for (int i = 0; i < req->header_count; i++) {
+        if (is_hop_by_hop(req->headers[i].name))
+            continue;
+        n = snprintf(out + used, cap - used, "%s: %s\r\n", req->headers[i].name,
+                     req->headers[i].value);
+        if (n < 0 || (size_t)n >= cap - used)
+            return -1;
+        used += (size_t)n;
+    }
+
+    n = snprintf(out + used, cap - used, "Connection: close\r\n\r\n");
+    if (n < 0 || (size_t)n >= cap - used)
+        return -1;
+    return (int)(used + (size_t)n);
+}
+
+/* out(크기 cap, 지금 used만큼 참)의 끝에 line과 "\r\n"을 붙인다. 자리가 없으면 -1. */
+static int append_line(char *out, size_t cap, size_t *used, const char *line)
+{
+    int n = snprintf(out + *used, cap - *used, "%s\r\n", line);
+    if (n < 0 || (size_t)n >= cap - *used)
+        return -1;
+    *used += (size_t)n;
+    return 0;
+}
+
+/* 뒤 서버 응답을 읽어 클라에 넘긴다. 상태 줄과 헤더는 Connection만 클라 쪽 값으로 바꾸고, 본문은 바이트 그대로 보낸다.
+ * 클라에 아무것도 보내기 전에 실패하면 -1(→ 502), 뒤 서버가 제한 시간 안에 답을 시작하지 않으면 PROXY_TIMED_OUT(→ 504).
+ * 보내기 시작했으면 *sent = 1, 뒤 서버의 상태 코드를 돌려준다. */
+static int relay_response(int backend_fd, int connfd, char *head, int *keep_alive, int *sent)
+{
+    struct line_reader reader;
+    char line[LINE_READER_BUF_SIZE];
+    init_line_reader(&reader, backend_fd);
+
+    /* 상태 줄 "HTTP/1.1 200 OK"에서 상태 코드만 꺼내 둔다 (로그용).
+     * 읽기 시간 제한(SO_RCVTIMEO)이 지나면 read가 EAGAIN으로 실패한다 = 뒤 서버가 답을 안 한다 */
+    ssize_t first = read_line(&reader, line, sizeof(line));
+    if (first == READ_LINE_ERROR && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return PROXY_TIMED_OUT;
+    if (first <= 0)
+        return -1;
+    int status;
+    if (sscanf(line, "HTTP/%*d.%*d %d", &status) != 1 || status < 100 || status > 999)
+        return -1;
+    size_t used = 0;
+    if (append_line(head, PROXY_HEAD_MAX, &used, line) < 0)
+        return -1;
+
+    /* 헤더: Content-Length로 본문 끝을 알아 둔다. 없으면 뒤 서버가 닫을 때까지가 본문이다 */
+    int has_length = 0;
+    size_t body_len = 0;
+    for (;;) {
+        ssize_t n = read_line(&reader, line, sizeof(line));
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            break;
+        char *colon = strchr(line, ':');
+        if (colon == NULL)
+            return -1;
+        *colon = '\0';
+        const char *value = colon + 1;
+        while (*value == ' ' || *value == '\t')
+            value++;
+        if (strcasecmp(line, "Connection") == 0 || strcasecmp(line, "Keep-Alive") == 0)
+            continue;
+        if (strcasecmp(line, "Content-Length") == 0) {
+            char *end;
+            errno = 0;
+            unsigned long long v = strtoull(value, &end, 10);
+            if (end == value || *end != '\0' || errno != 0 || value[0] == '-')
+                return -1;
+            has_length = 1;
+            body_len = (size_t)v;
+        }
+        *colon = ':';
+        if (append_line(head, PROXY_HEAD_MAX, &used, line) < 0)
+            return -1;
+    }
+
+    /* 길이를 모르면 본문 끝 = 연결 끝이라서, 클라와의 연결도 닫아야 클라가 끝을 안다 */
+    if (!has_length)
+        *keep_alive = 0;
+    int n = snprintf(head + used, PROXY_HEAD_MAX - used, "Connection: %s\r\n\r\n",
+                     *keep_alive ? "keep-alive" : "close");
+    if (n < 0 || (size_t)n >= PROXY_HEAD_MAX - used)
+        return -1;
+    used += (size_t)n;
+
+    *sent = 1;
+    if (write_all(connfd, head, used) < 0) {
+        *keep_alive = 0;
+        return status;
+    }
+
+    /* 본문: 이미지도 있으니 줄이 아니라 바이트로 옮긴다. 헤더를 읽다 reader에 남은 본문부터 나온다 */
+    char buf[PROXY_COPY_BUF];
+    size_t left = body_len;
+    while (!has_length || left > 0) {
+        size_t want = sizeof(buf);
+        if (has_length && left < want)
+            want = left;
+        ssize_t got = read_some(&reader, buf, want);
+        if (got == 0 && !has_length) /* 길이 없는 본문의 정상 끝 */
+            break;
+        if (got <= 0 || write_all(connfd, buf, (size_t)got) < 0) {
+            *keep_alive = 0; /* 본문이 덜 갔다. 클라 쪽 연결 상태를 믿을 수 없으니 닫는다 */
+            break;
+        }
+        left -= (size_t)got;
+    }
+    return status;
+}
+
+/* 이미 접속한 서버(backend_fd)에 요청을 uri로 보내고, 받은 응답을 클라에 전달한 뒤 backend_fd를 닫는다.
+ * 리버스·포워드 프록시가 같이 쓰는 중계 부분이다.
+ * *sent가 1이면 응답을 이미 보냈다(상태 코드는 로그용). 0이면 부른 쪽이 돌려준 에러 코드로 답한다. */
+static int relay_through(int backend_fd, int connfd, const struct http_request *req,
+                         const char *uri, int *keep_alive, int *sent)
+{
+    char *head = malloc(PROXY_HEAD_MAX);
+    if (head == NULL) {
+        close(backend_fd);
+        return 500;
+    }
+    int head_len = build_backend_request(req, uri, head, PROXY_HEAD_MAX);
+    if (head_len < 0) {
+        close(backend_fd);
+        free(head);
+        return 500;
+    }
+
+    /* 뒤 서버와 주고받는 읽기·쓰기 한 번마다 최대 대기 시간을 건다. 안 걸면 멈춘 뒤 서버가 작업 스레드를 영원히 붙잡는다 */
+    struct timeval tv = { .tv_sec = BACKEND_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(backend_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(backend_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* 뒤 서버에도 요청 머리와 본문을 따로 쓰므로 Nagle을 끈다 (conn.c와 같은 이유) */
+    int one = 1;
+    setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    int status = 502;
+    if (write_all(backend_fd, head, (size_t)head_len) == 0 &&
+        (req->body_len == 0 || write_all(backend_fd, req->body, req->body_len) == 0)) {
+        int rc = relay_response(backend_fd, connfd, head, keep_alive, sent);
+        if (rc == PROXY_TIMED_OUT)
+            status = 504;
+        else if (rc > 0)
+            status = rc;
+    }
+    close(backend_fd);
+    free(head);
+    return status;
+}
+
+/* [리버스 프록시] 요청을 규칙에 맞는 뒤 서버로 넘기고 응답을 클라에 전달한다.
+ * 뒤 서버를 Round-Robin으로 고르고, 접속이 안 되면 다음 서버를 시도한다.
+ * *sent가 1이면 응답을 이미 보냈다(상태 코드는 로그용). 0이면 부른 쪽이 돌려준 에러 코드로 답한다. */
+int serve_proxy(int connfd, struct proxy_route *route, const struct http_request *req,
+                int *keep_alive, int *sent)
+{
+    *sent = 0;
+    char uri[HTTP_URI_MAX];
+    if (rewrite_uri(route, req->uri, uri, sizeof(uri)) < 0)
+        return 414;
+
+    /* 차례인 서버부터 시도하고, 죽어 있으면 다음 서버로 넘어간다 */
+    int backend_fd = -1;
+    for (int tries = 0; tries < route->backend_count && backend_fd < 0; tries++) {
+        const struct proxy_backend *b = &route->backends[pick_backend(route)];
+        backend_fd = connect_to_server(b->host, b->port);
+        if (backend_fd < 0)
+            fprintf(stderr, "proxy: backend %s:%s unavailable\n", b->host, b->port);
+    }
+    if (backend_fd < 0)
+        return 502; /* 뒤 서버가 전부 응답하지 않는다 */
+    return relay_through(backend_fd, connfd, req, uri, keep_alive, sent);
+}
+
+/* 설정 파일 한 줄이 "forward 127.0.0.1:9001 127.0.0.1:9002"면 포워드 프록시를 켜고 허용 대상을 table에 넣는다.
+ * 각 대상은 반드시 '호스트:포트' 형식이어야 한다. 포트를 안 적으면 임의 포트로 열려 SSRF가 되므로 거부한다.
+ * forward 줄이면 1, 아니면 0(다른 규칙 줄), 형식이 틀리면 -1(대상이 없거나·형식 오류·너무 많음). */
+int parse_forward_line(const char *line, struct proxy_table *table)
+{
+    while (*line == ' ' || *line == '\t')
+        line++;
+    if (strncmp(line, "forward", 7) != 0 || (line[7] != ' ' && line[7] != '\t'))
+        return 0;
+
+    const char *p = line + 7;
+    int added = 0;
+    for (;;) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0' || *p == '\r' || *p == '\n' || *p == '#')
+            break;
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            p++;
+        size_t len = (size_t)(p - start);
+        if (table->forward_dest_count >= FORWARD_MAX_HOSTS)
+            return -1;
+        /* 리버스 프록시의 뒤 서버 주소와 같은 '호스트:포트' 파서를 쓴다. 포트가 없으면 여기서 실패한다 */
+        if (parse_backend(start, len, &table->forward_dests[table->forward_dest_count]) < 0)
+            return -1;
+        table->forward_dest_count++;
+        added++;
+    }
+    if (added == 0) /* 허용 대상 없이 켜면 아무 데나 열린다고 오해할 수 있어 막는다 */
+        return -1;
+    table->forward_enabled = 1;
+    return 1;
+}
+
+/* URI가 "http://"나 "https://"로 시작하는 전체 주소면 1. 포워드 프록시로 보낼 요청인지 가를 때 쓴다. */
+int is_absolute_uri(const char *uri)
+{
+    return strncasecmp(uri, "http://", 7) == 0 || strncasecmp(uri, "https://", 8) == 0;
+}
+
+/* 전체 주소 "http://127.0.0.1:9001/a?b=1"을 호스트 "127.0.0.1", 포트 "9001", 경로 "/a?b=1"로 나눈다.
+ * 포트가 없으면 80, 경로가 없으면 "/". 성공 0, 형식이 틀리면 ABSOLUTE_URI_BAD, https면 ABSOLUTE_URI_HTTPS. */
+int parse_absolute_uri(const char *uri, char *host, size_t host_cap, char *port, size_t port_cap,
+                       char *path, size_t path_cap)
+{
+    if (strncasecmp(uri, "https://", 8) == 0)
+        return ABSOLUTE_URI_HTTPS;
+    if (strncasecmp(uri, "http://", 7) != 0)
+        return ABSOLUTE_URI_BAD;
+
+    /* 주소 부분(authority)은 "http://" 뒤부터 '/'나 '?' 앞까지 */
+    const char *auth = uri + 7;
+    size_t auth_len = strcspn(auth, "/?");
+    const char *rest = auth + auth_len;
+    if (auth_len == 0 || memchr(auth, '@', auth_len) != NULL || auth[0] == '[')
+        return ABSOLUTE_URI_BAD; /* 빈 호스트, 사용자 정보("user@"), IPv6("[::1]")는 받지 않는다 */
+
+    const char *colon = memchr(auth, ':', auth_len);
+    size_t host_len = colon ? (size_t)(colon - auth) : auth_len;
+    if (host_len == 0 || host_len >= host_cap)
+        return ABSOLUTE_URI_BAD;
+    memcpy(host, auth, host_len);
+    host[host_len] = '\0';
+
+    if (colon) {
+        size_t port_len = auth_len - host_len - 1;
+        if (port_len == 0 || port_len >= port_cap)
+            return ABSOLUTE_URI_BAD;
+        for (size_t i = 0; i < port_len; i++) {
+            if (colon[1 + i] < '0' || colon[1 + i] > '9')
+                return ABSOLUTE_URI_BAD;
+        }
+        memcpy(port, colon + 1, port_len);
+        port[port_len] = '\0';
+    } else {
+        if (port_cap < 3)
+            return ABSOLUTE_URI_BAD;
+        snprintf(port, port_cap, "80");
+    }
+
+    /* 경로: 비었으면 "/", '?'로 시작하면 앞에 '/'를 붙인다 ("http://h?x" → "/?x") */
+    int n = snprintf(path, path_cap, "%s%s", rest[0] == '/' ? "" : "/", rest);
+    if (n < 0 || (size_t)n >= path_cap)
+        return ABSOLUTE_URI_BAD;
+    return 0;
+}
+
+/* host:port가 설정 파일의 forward 줄에 적힌 대상과 정확히 맞으면 1.
+ * 호스트는 대소문자를 안 가리고, 포트는 정확히 같아야 한다. 포트까지 봐야 허용 호스트의 다른 포트로 새는 SSRF를 막는다. */
+int is_forward_allowed(const struct proxy_table *table, const char *host, const char *port)
+{
+    if (table == NULL || !table->forward_enabled)
+        return 0;
+    for (int i = 0; i < table->forward_dest_count; i++) {
+        if (strcasecmp(table->forward_dests[i].host, host) == 0 &&
+            strcmp(table->forward_dests[i].port, port) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* [포워드 프록시] 클라가 적어 보낸 전체 주소의 서버에 직접 접속해 요청을 보내고, 응답을 클라에 전달한다.
+ * 리버스와 달리 목적지를 클라가 정한다. 그래서 허용 목록에 있는 호스트로만 보낸다.
+ * 꺼져 있거나 허용 안 된 호스트면 403, 주소 형식이 틀리면 400, https면 501, 접속 실패 502, 시간 초과 504. */
+int serve_forward_proxy(int connfd, const struct proxy_table *table, const struct http_request *req,
+                        int *keep_alive, int *sent)
+{
+    *sent = 0;
+    if (table == NULL || !table->forward_enabled)
+        return 403;
+
+    char host[PROXY_HOST_MAX], port[PROXY_PORT_MAX], path[HTTP_URI_MAX];
+    int rc = parse_absolute_uri(req->uri, host, sizeof(host), port, sizeof(port), path, sizeof(path));
+    if (rc == ABSOLUTE_URI_HTTPS)
+        return 501;
+    if (rc < 0)
+        return 400;
+    if (!is_forward_allowed(table, host, port)) /* 호스트:포트가 허용 목록과 정확히 맞아야 한다 */
+        return 403;
+
+    int backend_fd = connect_to_server(host, port); /* 이름이면 getaddrinfo가 DNS로 IP를 찾는다 */
+    if (backend_fd < 0) {
+        fprintf(stderr, "forward proxy: %s:%s unavailable\n", host, port);
+        return 502;
+    }
+    /* 서버에는 전체 주소가 아니라 경로만 보낸다. 서버 입장에선 보통 요청이다 */
+    return relay_through(backend_fd, connfd, req, path, keep_alive, sent);
+}
